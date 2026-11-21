@@ -1,6 +1,21 @@
 package br.marcos.controleremoto;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Intent;
+import android.speech.RecognizerIntent;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
+import android.widget.Toast;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -29,6 +44,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
@@ -62,6 +78,17 @@ public class MainActivity extends Activity {
     EditText campoIp, campoPin, digitacao;
     boolean noPad = false, segurando = false, ignorarTexto = false;
     String nomePc = "", anterior = "";
+    // voz e assistente
+    static final int OUVIR_DITADO = 1, OUVIR_BUSCA = 2, OUVIR_ASSISTENTE = 3;
+    static final String MODELO_PADRAO = "gpt-5.4-mini";
+    final LinkedBlockingQueue<String> respostas = new LinkedBlockingQueue<>();
+    final List<String[]> conversa = new ArrayList<>();
+    JSONArray historico = new JSONArray();
+    TextToSpeech tts;
+    boolean noAssistente = false, conversaContinua = false, usarEsforco = true, pensando = false;
+    LinearLayout chatLista;
+    ScrollView chatScroll;
+    TextView assistStatus;
 
     // ------------------------------------------------------------------ utilitários de tela
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
@@ -109,19 +136,30 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("cfg", MODE_PRIVATE);
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
+        tts = new TextToSpeech(this, st -> {
+            if (st == TextToSpeech.SUCCESS) tts.setLanguage(new Locale("pt", "BR"));
+        });
+        tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+            public void onStart(String id) { }
+            public void onError(String id) { }
+            public void onDone(String id) {
+                runOnUiThread(() -> { if (noAssistente && conversaContinua && !pensando) ouvir(OUVIR_ASSISTENTE, "Pode falar..."); });
+            }
+        });
         mostrarConexao();
         buscar();
     }
 
     @Override public void onBackPressed() {
-        if (noPad) desconectar(); else super.onBackPressed();
+        if (noAssistente) mostrarPad();
+        else if (noPad) desconectar(); else super.onBackPressed();
     }
 
-    @Override protected void onDestroy() { fechar(); super.onDestroy(); }
+    @Override protected void onDestroy() { fechar(); if (tts != null) tts.shutdown(); super.onDestroy(); }
 
     // ------------------------------------------------------------------ tela de conexão
     void mostrarConexao() {
-        noPad = false; segurando = false;
+        noPad = false; segurando = false; noAssistente = false;
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         ScrollView sv = new ScrollView(this); sv.setBackgroundColor(BG);
         LinearLayout l = vertical(); l.setPadding(dp(24), dp(32), dp(24), dp(24));
@@ -224,7 +262,10 @@ public class MainActivity extends Activity {
                 sock = s; conectou = true;
                 iniciarEnvio(o);
                 runOnUiThread(() -> { nomePc = nome.isEmpty() ? ip : nome; mostrarPad(); });
-                while (in.readLine() != null) { /* mantém a conexão */ }
+                String linha;
+                while ((linha = in.readLine()) != null) {
+                    if (linha.startsWith("r,")) respostas.offer(linha.substring(2));
+                }
             } catch (Exception e) {
                 if (!conectou) {
                     runOnUiThread(() -> { if (!noPad) status.setText("Não conectou. Confira o IP, a rede e se o programa está aberto no notebook."); });
@@ -278,7 +319,7 @@ public class MainActivity extends Activity {
     float sensibilidade() { return 0.3f + prefs.getInt("sens", 15) * 0.08f; }
 
     void mostrarPad() {
-        noPad = true; segurando = false; anterior = "";
+        noPad = true; noAssistente = false; segurando = false; anterior = "";
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         LinearLayout raiz = vertical(); raiz.setBackgroundColor(BG); raiz.setPadding(dp(10), dp(10), dp(10), dp(10));
 
@@ -315,6 +356,11 @@ public class MainActivity extends Activity {
         bts.addView(botao("Direito", CARD, v -> enviar("c,r")), peso(3));
         raiz.addView(bts, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
 
+        LinearLayout voz = horizontal();
+        voz.addView(botao("🎤 Ditar", 0xFF5B3FD1, v -> ouvir(OUVIR_DITADO, "Fale o texto para digitar")), peso(3));
+        voz.addView(botao("🔎 Buscar por voz", 0xFF5B3FD1, v -> ouvir(OUVIR_BUSCA, "O que você quer pesquisar?")), peso(3));
+        voz.addView(botao("🤖 Assistente", AZUL, v -> mostrarAssistente()), peso(3));
+        raiz.addView(voz, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)));
         raiz.addView(linhaTeclas(new String[][]{
                 {"⌨ Teclado", "#kbd"}, {"Enter", "k,enter"}, {"⌫", "k,backspace"}, {"Esc", "k,esc"}, {"Tab", "k,tab"},
                 {"←", "k,left"}, {"↑", "k,up"}, {"↓", "k,down"}, {"→", "k,right"}, {"Del", "k,delete"},
@@ -376,6 +422,293 @@ public class MainActivity extends Activity {
         }
         hs.addView(l);
         return hs;
+    }
+
+    // ------------------------------------------------------------------ voz
+    void ouvir(int codigo, String dica) {
+        if (tts != null) tts.stop();
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR");
+        i.putExtra(RecognizerIntent.EXTRA_PROMPT, dica);
+        try { startActivityForResult(i, codigo); }
+        catch (Exception e) { Toast.makeText(this, "Reconhecimento de voz indisponível. Instale/atualize o app Google.", Toast.LENGTH_LONG).show(); }
+    }
+
+    @Override protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (res != RESULT_OK || data == null) return;
+        ArrayList<String> r = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+        if (r == null || r.isEmpty()) return;
+        String fala = r.get(0);
+        if (req == OUVIR_DITADO) enviarTexto(fala);
+        else if (req == OUVIR_BUSCA) { enviar("b," + fala); Toast.makeText(this, "Pesquisando: " + fala, Toast.LENGTH_SHORT).show(); }
+        else if (req == OUVIR_ASSISTENTE) perguntar(fala);
+    }
+
+    void falar(String t) {
+        if (tts == null) return;
+        tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "resp");
+    }
+
+    // ------------------------------------------------------------------ assistente
+    static final String SISTEMA = "Você é o assistente pessoal do usuário, falando português do Brasil. "
+            + "Você conversa por voz pelo tablet e controla o notebook Windows dele com as ferramentas. "
+            + "Quando ele pedir uma ação, execute na hora com as ferramentas, sem pedir confirmação (o app confirma desligar, reiniciar e suspender). "
+            + "Pode encadear várias ferramentas para cumprir um pedido (ex.: abrir o bloco de notas e depois digitar um texto). "
+            + "Respostas curtas e naturais para serem faladas: uma ou duas frases, sem markdown, sem listas, sem emojis. "
+            + "Para sites conhecidos use o endereço direto (youtube.com, web.whatsapp.com, mail.google.com, instagram.com). "
+            + "Se um programa não for encontrado, chame listar_programas e tente de novo com o nome certo.";
+
+    static final String FERRAMENTAS = """
+        [
+         {"type":"function","function":{"name":"abrir_site","description":"Abre um site ou link no navegador do notebook.",
+          "parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+         {"type":"function","function":{"name":"pesquisar","description":"Pesquisa algo no Google ou no YouTube, no notebook.",
+          "parameters":{"type":"object","properties":{"texto":{"type":"string"},"onde":{"type":"string","enum":["google","youtube"]}},"required":["texto"]}}},
+         {"type":"function","function":{"name":"abrir_programa","description":"Abre um programa instalado no notebook pelo nome (ex.: Chrome, Word, Excel, Spotify, WhatsApp, Bloco de Notas, Calculadora).",
+          "parameters":{"type":"object","properties":{"nome":{"type":"string"}},"required":["nome"]}}},
+         {"type":"function","function":{"name":"listar_programas","description":"Lista os nomes dos programas instalados no notebook.",
+          "parameters":{"type":"object","properties":{}}}},
+         {"type":"function","function":{"name":"digitar","description":"Digita um texto no notebook, onde o cursor estiver.",
+          "parameters":{"type":"object","properties":{"texto":{"type":"string"}},"required":["texto"]}}},
+         {"type":"function","function":{"name":"teclas","description":"Aperta uma tecla ou atalho no notebook. Use nomes unidos por +: ctrl, alt, shift, win, enter, esc, tab, backspace, delete, space, left, right, up, down, home, end, pgup, pgdn, f1-f12, letras e números. Mídia: volup, voldown, mute, play, next, prev. Exemplos: ctrl+c, alt+tab, win+d, alt+f4, ctrl+t, ctrl+w.",
+          "parameters":{"type":"object","properties":{"atalho":{"type":"string"},"repeticoes":{"type":"integer"}},"required":["atalho"]}}},
+         {"type":"function","function":{"name":"energia","description":"Bloqueia, suspende, desliga ou reinicia o notebook, ou cancela um desligamento agendado.",
+          "parameters":{"type":"object","properties":{"acao":{"type":"string","enum":["bloquear","suspender","desligar","reiniciar","cancelar_desligamento"]}},"required":["acao"]}}}
+        ]""";
+
+    void mostrarAssistente() {
+        noAssistente = true;
+        LinearLayout raiz = vertical(); raiz.setBackgroundColor(BG); raiz.setPadding(dp(10), dp(10), dp(10), dp(10));
+        LinearLayout topo = horizontal();
+        TextView tit = texto("🤖 Assistente", 20, Color.WHITE); tit.setTypeface(Typeface.DEFAULT_BOLD);
+        topo.addView(tit, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button limpar = botao("Nova conversa", CARD, v -> { historico = new JSONArray(); conversa.clear(); chatLista.removeAllViews(); assistStatus.setText("Conversa reiniciada."); });
+        limpar.setTextSize(14); topo.addView(limpar);
+        Button cfg = botao("⚙ Chave", CARD, v -> configurarChave()); cfg.setTextSize(14);
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT); cp.leftMargin = dp(6);
+        topo.addView(cfg, cp);
+        Button volta = botao("← Mouse", VERMELHO, v -> { conversaContinua = false; if (tts != null) tts.stop(); mostrarPad(); }); volta.setTextSize(14);
+        topo.addView(volta, cp);
+        raiz.addView(topo);
+
+        chatScroll = new ScrollView(this);
+        chatLista = vertical(); chatLista.setPadding(0, dp(6), 0, dp(6));
+        chatScroll.addView(chatLista);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1); sp.topMargin = dp(8);
+        raiz.addView(chatScroll, sp);
+        for (String[] m : conversa) desenharBalao(m[0], m[1]);
+
+        assistStatus = texto(prefs.getString("chave", "").isEmpty() ? "Toque em ⚙ Chave e cole sua chave da OpenAI." : "Toque em Falar e peça algo, ex.: \"abre o YouTube e pesquisa louvores\".", 14, AMARELO);
+        raiz.addView(assistStatus, mt(4));
+
+        LinearLayout fala = horizontal();
+        fala.addView(botao("🎤 Falar", 0xFF5B3FD1, v -> ouvir(OUVIR_ASSISTENTE, "Pode falar...")), peso(3));
+        Button cont = botao(conversaContinua ? "Conversa contínua: LIGADA" : "Conversa contínua: desligada", conversaContinua ? VERDE : CARD, null);
+        cont.setOnClickListener(v -> {
+            conversaContinua = !conversaContinua;
+            cont.setText(conversaContinua ? "Conversa contínua: LIGADA" : "Conversa contínua: desligada");
+            cont.setBackground(fundo(conversaContinua ? VERDE : CARD));
+            if (conversaContinua) ouvir(OUVIR_ASSISTENTE, "Pode falar...");
+        });
+        cont.setTextSize(14);
+        fala.addView(cont, peso(3));
+        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60)); fp.topMargin = dp(8);
+        raiz.addView(fala, fp);
+
+        LinearLayout escreve = horizontal();
+        EditText pergunta = campo("Ou escreva para o assistente", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        pergunta.setImeOptions(EditorInfo.IME_ACTION_SEND);
+        Runnable mandar = () -> { String q = pergunta.getText().toString().trim(); if (!q.isEmpty()) { pergunta.setText(""); perguntar(q); } };
+        pergunta.setOnEditorActionListener((v, a, e) -> { mandar.run(); return true; });
+        escreve.addView(pergunta, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button env = botao("Enviar", AZUL, v -> mandar.run());
+        escreve.addView(env, cp);
+        raiz.addView(escreve, mt(8));
+        setContentView(raiz);
+        if (prefs.getString("chave", "").isEmpty()) configurarChave();
+    }
+
+    void configurarChave() {
+        LinearLayout l = vertical(); l.setPadding(dp(20), dp(10), dp(20), 0);
+        EditText chave = new EditText(this); chave.setHint("Chave da API (sk-...)"); chave.setSingleLine(true);
+        chave.setText(prefs.getString("chave", ""));
+        EditText modelo = new EditText(this); modelo.setHint("Modelo"); modelo.setSingleLine(true);
+        modelo.setText(prefs.getString("modelo", MODELO_PADRAO));
+        l.addView(texto("Crie a chave em platform.openai.com > API keys (mesmo e-mail do ChatGPT Pro, com os créditos resgatados).", 14, Color.GRAY));
+        l.addView(chave, mt(8));
+        l.addView(texto("Modelo:", 14, Color.GRAY), mt(8));
+        l.addView(modelo);
+        new AlertDialog.Builder(this).setTitle("Assistente — OpenAI").setView(l)
+                .setPositiveButton("Salvar", (d, w) -> {
+                    prefs.edit().putString("chave", chave.getText().toString().trim())
+                            .putString("modelo", modelo.getText().toString().trim().isEmpty() ? MODELO_PADRAO : modelo.getText().toString().trim()).apply();
+                    usarEsforco = true;
+                    if (assistStatus != null) assistStatus.setText("Chave salva. Toque em Falar.");
+                })
+                .setNegativeButton("Cancelar", null).show();
+    }
+
+    void adicionarBalao(String quem, String txt) {
+        conversa.add(new String[]{quem, txt});
+        if (noAssistente && chatLista != null) desenharBalao(quem, txt);
+    }
+
+    void desenharBalao(String quem, String txt) {
+        TextView t = texto(txt, 16, Color.WHITE);
+        int cor = quem.equals("Você") ? 0xFF2D3F7A : quem.equals("Ação") ? 0xFF1F3A2E : quem.equals("Erro") ? VERMELHO : CARD;
+        t.setBackground(fundo(cor)); t.setPadding(dp(14), dp(10), dp(14), dp(10));
+        if (quem.equals("Ação")) { t.setTextSize(13); t.setTextColor(0xFF9FE0BD); }
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.topMargin = dp(6);
+        p.gravity = quem.equals("Você") ? Gravity.END : Gravity.START;
+        if (quem.equals("Você")) p.leftMargin = dp(80); else p.rightMargin = dp(80);
+        chatLista.addView(t, p);
+        chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    void statusAssistente(String s) { runOnUiThread(() -> { if (assistStatus != null) assistStatus.setText(s); }); }
+
+    void perguntar(String texto) {
+        String chave = prefs.getString("chave", "");
+        if (chave.isEmpty()) { configurarChave(); return; }
+        if (pensando) return;
+        pensando = true;
+        adicionarBalao("Você", texto);
+        statusAssistente("Pensando...");
+        new Thread(() -> {
+            String resposta = null;
+            try {
+                if (historico.length() == 0 || historico.length() > 40) {
+                    historico = new JSONArray();
+                    historico.put(new JSONObject().put("role", "system").put("content", SISTEMA));
+                }
+                historico.put(new JSONObject().put("role", "user").put("content", texto));
+                for (int volta = 0; volta < 8 && resposta == null; volta++) {
+                    JSONObject m = chamarOpenAI(chave).getJSONArray("choices").getJSONObject(0).getJSONObject("message");
+                    JSONArray calls = m.optJSONArray("tool_calls");
+                    JSONObject limpo = new JSONObject().put("role", "assistant");
+                    String conteudo = m.isNull("content") ? null : m.optString("content", null);
+                    if (conteudo != null) limpo.put("content", conteudo);
+                    if (calls != null && calls.length() > 0) limpo.put("tool_calls", calls);
+                    historico.put(limpo);
+                    if (calls == null || calls.length() == 0) { resposta = conteudo == null ? "Pronto." : conteudo; break; }
+                    for (int i = 0; i < calls.length(); i++) {
+                        JSONObject c = calls.getJSONObject(i);
+                        JSONObject fn = c.getJSONObject("function");
+                        String nome = fn.getString("name");
+                        JSONObject args;
+                        try { args = new JSONObject(fn.optString("arguments", "{}")); } catch (Exception e) { args = new JSONObject(); }
+                        statusAssistente("Executando: " + nome.replace('_', ' ') + "...");
+                        String res = executarFerramenta(nome, args);
+                        String desc = "⚙ " + nome.replace('_', ' ') + " " + resumoArgs(args) + " → " + res;
+                        runOnUiThread(() -> adicionarBalao("Ação", desc.length() > 220 ? desc.substring(0, 220) + "…" : desc));
+                        historico.put(new JSONObject().put("role", "tool").put("tool_call_id", c.getString("id")).put("content", res));
+                    }
+                }
+                if (resposta == null) resposta = "Pronto.";
+                String fr = resposta;
+                runOnUiThread(() -> { pensando = false; adicionarBalao("Assistente", fr); statusAssistente(""); falar(fr); });
+            } catch (Exception e) {
+                historico = new JSONArray();
+                String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                runOnUiThread(() -> { pensando = false; adicionarBalao("Erro", msg); statusAssistente(""); falar("Deu um erro. " + (msg.length() < 120 ? msg : "")); });
+            }
+        }).start();
+    }
+
+    String resumoArgs(JSONObject a) {
+        StringBuilder sb = new StringBuilder();
+        java.util.Iterator<String> it = a.keys();
+        while (it.hasNext()) { sb.append(a.optString(it.next())); if (it.hasNext()) sb.append(", "); }
+        return sb.length() == 0 ? "" : "(" + sb + ")";
+    }
+
+    JSONObject chamarOpenAI(String chave) throws Exception {
+        JSONObject corpo = new JSONObject();
+        corpo.put("model", prefs.getString("modelo", MODELO_PADRAO));
+        corpo.put("messages", historico);
+        corpo.put("tools", new JSONArray(FERRAMENTAS));
+        if (usarEsforco) corpo.put("reasoning_effort", "low");
+        HttpURLConnection c = (HttpURLConnection) new URL("https://api.openai.com/v1/chat/completions").openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(90000);
+        c.setRequestProperty("Authorization", "Bearer " + chave);
+        c.setRequestProperty("Content-Type", "application/json");
+        try (OutputStream o = c.getOutputStream()) { o.write(corpo.toString().getBytes(StandardCharsets.UTF_8)); }
+        int cod = c.getResponseCode();
+        InputStream is = cod < 400 ? c.getInputStream() : c.getErrorStream();
+        String body = ler(is);
+        if (cod == 400 && usarEsforco && body.contains("reasoning")) { usarEsforco = false; return chamarOpenAI(chave); }
+        if (cod >= 400) {
+            String det = body;
+            try { det = new JSONObject(body).getJSONObject("error").optString("message", body); } catch (Exception ignored) { }
+            if (cod == 401) throw new Exception("Chave de API inválida. Toque em ⚙ Chave e confira.");
+            if (cod == 429) throw new Exception("Sem créditos ou limite atingido na API. Confira se os créditos do ChatGPT Pro foram resgatados. (" + det + ")");
+            if (cod == 404 || det.contains("model")) throw new Exception("Problema com o modelo \"" + prefs.getString("modelo", MODELO_PADRAO) + "\": " + det + " Troque o modelo em ⚙ Chave.");
+            throw new Exception("Erro " + cod + ": " + det);
+        }
+        return new JSONObject(body);
+    }
+
+    static String ler(InputStream is) throws Exception {
+        if (is == null) return "";
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192]; int n;
+        while ((n = is.read(buf)) > 0) b.write(buf, 0, n);
+        is.close();
+        return new String(b.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    String esperarResposta() throws InterruptedException {
+        String r = respostas.poll(8, TimeUnit.SECONDS);
+        return r == null ? "O notebook não respondeu." : r;
+    }
+
+    boolean confirmar(String pergunta) throws InterruptedException {
+        CountDownLatch l = new CountDownLatch(1);
+        boolean[] ok = {false};
+        runOnUiThread(() -> new AlertDialog.Builder(this).setMessage(pergunta)
+                .setPositiveButton("Sim", (d, w) -> { ok[0] = true; l.countDown(); })
+                .setNegativeButton("Não", (d, w) -> l.countDown())
+                .setOnCancelListener(d -> l.countDown()).show());
+        l.await(60, TimeUnit.SECONDS);
+        return ok[0];
+    }
+
+    String executarFerramenta(String nome, JSONObject a) throws Exception {
+        if (sock == null) return "Erro: o notebook está desconectado.";
+        switch (nome) {
+            case "abrir_site": {
+                String u = a.optString("url").trim();
+                if (!u.contains("://")) u = "https://" + u;
+                enviar("o," + u); return "Site aberto: " + u;
+            }
+            case "pesquisar": {
+                String t = a.optString("texto");
+                if ("youtube".equals(a.optString("onde"))) enviar("o,https://www.youtube.com/results?search_query=" + URLEncoder.encode(t, "UTF-8"));
+                else enviar("b," + t);
+                return "Pesquisa aberta no navegador.";
+            }
+            case "abrir_programa": respostas.clear(); enviar("p," + a.optString("nome")); return esperarResposta();
+            case "listar_programas": respostas.clear(); enviar("l,"); return esperarResposta();
+            case "digitar": enviarTexto(a.optString("texto")); return "Texto digitado.";
+            case "teclas": {
+                int n = Math.max(1, Math.min(50, a.optInt("repeticoes", 1)));
+                for (int i = 0; i < n; i++) enviar("k," + a.optString("atalho").toLowerCase(Locale.ROOT).replace(" ", ""));
+                return "Teclas enviadas.";
+            }
+            case "energia": {
+                String ac = a.optString("acao");
+                if (!ac.equals("bloquear") && !ac.equals("cancelar_desligamento")
+                        && !confirmar("Confirmar: " + ac.replace('_', ' ') + " o notebook?")) return "O usuário não confirmou.";
+                respostas.clear(); enviar("e," + ac); return esperarResposta();
+            }
+        }
+        return "Ferramenta desconhecida.";
     }
 
     // ------------------------------------------------------------------ touchpad

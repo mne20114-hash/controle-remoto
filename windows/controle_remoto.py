@@ -2,7 +2,9 @@
 """Controle Remoto - programa do notebook (Windows).
 Recebe comandos do app Android por Wi-Fi ou pela rede Bluetooth (ancoragem)
 e move o mouse / digita no Windows."""
-import json, os, random, socket, struct, sys, threading, time
+import glob, json, os, random, socket, struct, subprocess, sys, threading, time, unicodedata, webbrowser
+from difflib import get_close_matches
+from urllib.parse import quote_plus
 
 PORTA, PORTA_BUSCA = 8765, 8766
 WIN = sys.platform.startswith("win")
@@ -86,7 +88,102 @@ def digitar(texto):
         _key(scan=u, flags=0x06)
 
 
+# ------------------------------------------------------------ programas, sites e energia
+_apps = {}
+APELIDOS = {"bloco de notas": "notepad", "notepad": "notepad", "calculadora": "calc", "paint": "mspaint",
+            "explorador": "explorer", "explorador de arquivos": "explorer", "arquivos": "explorer",
+            "meu computador": "explorer", "gerenciador de tarefas": "taskmgr", "cmd": "cmd",
+            "prompt de comando": "cmd", "configuracoes": "ms-settings:", "painel de controle": "control",
+            "terminal": "wt", "powershell": "powershell"}
+
+
+def _norm(t):
+    t = unicodedata.normalize("NFKD", t.lower().strip())
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def carregar_apps():
+    m = {}
+    if WIN:
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-StartApps | ConvertTo-Json -Compress"],
+                                 capture_output=True, timeout=30, creationflags=0x08000000).stdout.decode("utf-8", "ignore")
+            dados = json.loads(out or "[]")
+            for a in (dados if isinstance(dados, list) else [dados]):
+                m[_norm(a["Name"])] = (a["Name"], "shell:AppsFolder\\" + a["AppID"])
+        except Exception as e:
+            print("Get-StartApps falhou:", e)
+        for pasta in (os.path.join(os.environ.get("ProgramData", ""), r"Microsoft\Windows\Start Menu\Programs"),
+                      os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs")):
+            for f in glob.glob(os.path.join(pasta, "**", "*.lnk"), recursive=True):
+                n = os.path.splitext(os.path.basename(f))[0]
+                m.setdefault(_norm(n), (n, f))
+    _apps.clear(); _apps.update(m)
+
+
+def _abrir(alvo):
+    if WIN:
+        os.startfile(alvo)
+    else:
+        print("abrir", alvo)
+
+
+def abrir_programa(nome):
+    n = _norm(nome)
+    if not _apps:
+        carregar_apps()
+    achado = _apps.get(n)
+    if not achado:
+        contem = [k for k in _apps if n in k] or [k for k in _apps if all(p in k for p in n.split())]
+        if contem:
+            achado = _apps[min(contem, key=len)]
+    if not achado:
+        prox = get_close_matches(n, list(_apps), n=1, cutoff=0.6)
+        if prox:
+            achado = _apps[prox[0]]
+    try:
+        if achado:
+            _abrir(achado[1]); return "Abri o programa: " + achado[0]
+        if n in APELIDOS:
+            _abrir(APELIDOS[n]); return "Abri: " + nome
+    except Exception as e:
+        return "Erro ao abrir %s: %s" % (nome, e)
+    return "Nao encontrei o programa '%s'. Use listar_programas para ver os nomes." % nome
+
+
+def energia(acao):
+    cmds = {"desligar": ["shutdown", "/s", "/t", "30"], "reiniciar": ["shutdown", "/r", "/t", "30"],
+            "cancelar_desligamento": ["shutdown", "/a"], "bloquear": ["rundll32.exe", "user32.dll,LockWorkStation"],
+            "suspender": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]}
+    if acao not in cmds:
+        return "Acao desconhecida."
+    if WIN:
+        subprocess.Popen(cmds[acao], creationflags=0x08000000)
+    else:
+        print("energia", acao)
+    return {"desligar": "O notebook desliga em 30 segundos.", "reiniciar": "O notebook reinicia em 30 segundos."}.get(acao, "Feito: " + acao)
+
+
 def executar(msg):
+    cmd, _, arg = msg.partition(",")
+    if cmd == "o":
+        _abrir(arg if "://" in arg or arg.startswith(("ms-", "shell:")) else "https://" + arg); return None
+    if cmd == "b":
+        webbrowser.open("https://www.google.com/search?q=" + quote_plus(arg)); return None
+    if cmd == "p":
+        return abrir_programa(arg)
+    if cmd == "l":
+        if not _apps:
+            carregar_apps()
+        return "Programas instalados: " + "; ".join(sorted(v[0] for v in _apps.values()))[:6000]
+    if cmd == "e":
+        return energia(arg)
+    executar_entrada(msg)
+    return None
+
+
+def executar_entrada(msg):
     cmd, _, arg = msg.partition(",")
     if cmd == "m":
         dx, dy = arg.split(","); _mouse(0x01, int(dx), int(dy))
@@ -147,9 +244,11 @@ def atender(conn, addr):
         estado["conectados"][ip] = nome or ip
         for raw in f:
             try:
-                executar(raw.decode("utf-8", "ignore").rstrip("\r\n"))
+                r = executar(raw.decode("utf-8", "ignore").rstrip("\r\n"))
             except Exception as e:
-                print("erro:", e)
+                r = None; print("erro:", e)
+            if r:
+                conn.sendall(("r," + r.replace("\n", " ") + "\n").encode("utf-8"))
     except OSError:
         pass
     finally:
@@ -249,6 +348,7 @@ def main():
         return
     threading.Thread(target=servidor_tcp, args=(s,), daemon=True).start()
     threading.Thread(target=servidor_busca, daemon=True).start()
+    threading.Thread(target=carregar_apps, daemon=True).start()
     try:
         r, _ = janela()
         r.mainloop()
