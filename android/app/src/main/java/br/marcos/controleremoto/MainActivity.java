@@ -96,6 +96,7 @@ public class MainActivity extends Activity {
     TextToSpeech tts;
     String modeloGeminiOk = null;
     List<String> modelosDisponiveis = null;
+    final Set<String> semThinking = new HashSet<>();
 
     // pergunta ao Google quais modelos a chave pode usar (flash primeiro, mais novos primeiro)
     List<String> modelosGemini(String chave) {
@@ -689,7 +690,9 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> { pensando = false; adicionarBalao("Assistente", fr); statusAssistente(""); falar(fr); });
             } catch (Exception e) {
                 historico = new JSONArray();
-                String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                String msg = (e instanceof java.net.SocketTimeoutException || "timeout".equals(e.getMessage()))
+                        ? "A IA demorou demais para responder. Tente de novo."
+                        : (e.getMessage() == null ? e.toString() : e.getMessage());
                 runOnUiThread(() -> { pensando = false; adicionarBalao("Erro", msg); statusAssistente(""); falar("Deu um erro. " + (msg.length() < 120 ? msg : "")); });
             }
         }).start();
@@ -780,20 +783,34 @@ public class MainActivity extends Activity {
         List<String> disp = modelosGemini(chave);
         String escolhido = modeloAtual(chave);
         if (disp.isEmpty() || disp.contains(escolhido)) modelos.add(escolhido);
-        for (String m : disp) { if (modelos.size() >= 6) break; modelos.add(m); }
+        for (String m : disp) { if (modelos.size() >= 5) break; modelos.add(m); }
         if (disp.isEmpty()) { modelos.add("gemini-3.5-flash"); modelos.add("gemini-3.5-flash-lite"); modelos.add("gemini-flash-latest"); }
         String body = null, aviso = "";
         StringBuilder erros = new StringBuilder();
         externo:
         for (String modelo : modelos) {
+            boolean pensarPouco = !semThinking.contains(modelo);
             for (int tent = 0; tent < 2; tent++) {
-                HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
-                c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(15000); c.setReadTimeout(90000);
-                c.setRequestProperty("x-goog-api-key", chave);
-                c.setRequestProperty("Content-Type", "application/json");
-                try (OutputStream o = c.getOutputStream()) { o.write(corpo.toString().getBytes(StandardCharsets.UTF_8)); }
-                int cod = c.getResponseCode();
-                String b = ler(cod < 400 ? c.getInputStream() : c.getErrorStream());
+                JSONObject envio = new JSONObject(corpo.toString());
+                if (pensarPouco) envio.put("generationConfig", new JSONObject().put("thinkingConfig", new JSONObject().put("thinkingLevel", "low")));
+                int cod; String b;
+                try {
+                    HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
+                    c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(10000); c.setReadTimeout(25000);
+                    c.setRequestProperty("x-goog-api-key", chave);
+                    c.setRequestProperty("Content-Type", "application/json");
+                    try (OutputStream o = c.getOutputStream()) { o.write(envio.toString().getBytes(StandardCharsets.UTF_8)); }
+                    cod = c.getResponseCode();
+                    b = ler(cod < 400 ? c.getInputStream() : c.getErrorStream());
+                } catch (java.net.SocketTimeoutException e) {
+                    erros.append("\n• ").append(modelo).append(": demorou demais");
+                    if (modelo.equals(modeloGeminiOk)) modeloGeminiOk = null;
+                    statusAssistente("Demorou, tentando outro modelo...");
+                    continue externo;
+                }
+                if (cod == 400 && pensarPouco && b.toLowerCase(Locale.ROOT).contains("think")) {
+                    semThinking.add(modelo); pensarPouco = false; tent--; continue;
+                }
                 if (cod < 400) { body = b; modeloGeminiOk = modelo; break externo; }
                 String det = b;
                 try { det = new JSONObject(b).getJSONObject("error").optString("message", b); } catch (Exception ignored) { }
