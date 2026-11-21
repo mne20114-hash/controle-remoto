@@ -7,6 +7,10 @@ import android.speech.RecognizerIntent;
 import android.speech.RecognitionListener;
 import android.speech.SpeechRecognizer;
 import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.media.AudioFormat;
+import android.media.AudioDeviceInfo;
+import android.media.MediaRecorder;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.widget.Toast;
@@ -104,6 +108,9 @@ public class MainActivity extends Activity {
     boolean ouvindo = false;
     int codigoOuvir = 0, pendenteOuvir = 0;
     TextView avisoVoz;
+    volatile boolean micAtivo = false;
+    boolean pendenteMic = false;
+    Button btMic;
 
     // pergunta ao Google quais modelos a chave pode usar (flash primeiro, mais novos primeiro)
     List<String> modelosGemini(String chave) {
@@ -382,7 +389,67 @@ public class MainActivity extends Activity {
         if (s != null) try { s.close(); } catch (Exception ignored) { }
     }
 
+    // ------------------------------------------------------------------ microfone do tablet no notebook
+    void atualizarBotaoMic() {
+        if (btMic == null) return;
+        btMic.setText(micAtivo ? "🎙 Mic no PC: ON" : "🎙 Mic no PC: OFF");
+        btMic.setBackground(fundo(micAtivo ? VERDE : CARD));
+    }
+
+    void alternarMic() {
+        if (micAtivo) { micAtivo = false; atualizarBotaoMic(); return; }
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            pendenteMic = true;
+            requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 8);
+            return;
+        }
+        iniciarMic();
+    }
+
+    void iniciarMic() {
+        String ip = prefs.getString("ip", ""), pin = prefs.getString("pin", "");
+        micAtivo = true; atualizarBotaoMic();
+        new Thread(() -> {
+            AudioRecord rec = null;
+            Socket s = new Socket();
+            String erro = null;
+            try {
+                s.connect(new InetSocketAddress(ip, 8767), 4000);
+                s.setTcpNoDelay(true);
+                OutputStream o = s.getOutputStream();
+                o.write(("PIN," + pin + "\n").getBytes(StandardCharsets.UTF_8)); o.flush();
+                s.setSoTimeout(5000);
+                String r = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8)).readLine();
+                s.setSoTimeout(0);
+                if ("NOCABLE".equals(r)) throw new Exception("Instale o VB-CABLE no notebook (botão na janela do programa) e reinicie o notebook.");
+                if (!"OK".equals(r)) throw new Exception("O notebook recusou o microfone. Atualize o programa do notebook.");
+                int taxa = 48000;
+                int min = AudioRecord.getMinBufferSize(taxa, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                rec = new AudioRecord(MediaRecorder.AudioSource.MIC, taxa, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 7680));
+                AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS))
+                    if (d.getType() == AudioDeviceInfo.TYPE_BUILTIN_MIC) { rec.setPreferredDevice(d); break; }
+                rec.startRecording();
+                runOnUiThread(() -> Toast.makeText(this, "🎙 Microfone do tablet ligado no notebook (\"CABLE Output\")", Toast.LENGTH_LONG).show());
+                byte[] buf = new byte[1920];
+                while (micAtivo && sock != null) {
+                    int n = rec.read(buf, 0, buf.length);
+                    if (n > 0) o.write(buf, 0, n);
+                }
+            } catch (Exception e) {
+                if (micAtivo) erro = e.getMessage() == null ? e.toString() : e.getMessage();
+            } finally {
+                micAtivo = false;
+                if (rec != null) { try { rec.stop(); } catch (Exception ignored) { } rec.release(); }
+                try { s.close(); } catch (Exception ignored) { }
+                String fe = erro;
+                runOnUiThread(() -> { atualizarBotaoMic(); if (fe != null) Toast.makeText(this, "Microfone: " + fe, Toast.LENGTH_LONG).show(); });
+            }
+        }).start();
+    }
+
     void desconectar() {
+        micAtivo = false;
         if (segurando) enviar("u,l");
         fechar(); mostrarConexao(); status.setText("Desconectado."); buscar();
     }
@@ -416,6 +483,9 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         clp.rightMargin = dp(6);
         topo.addView(clip, clp);
+        btMic = botao("", CARD, v -> alternarMic()); btMic.setTextSize(14);
+        atualizarBotaoMic();
+        topo.addView(btMic, clp);
         Button sair = botao("Sair", VERMELHO, v -> desconectar()); sair.setTextSize(14);
         topo.addView(sair);
         raiz.addView(topo);
@@ -531,6 +601,7 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 7);
             return;
         }
+        if (micAtivo) { Toast.makeText(this, "Desligue o \"Mic no PC\" para usar a voz do app.", Toast.LENGTH_LONG).show(); return; }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) { ouvirIntent(codigo, dica); return; }
         if (ouvindo && reconhecedor != null) { reconhecedor.stopListening(); return; }
         usarMicDoTablet();
@@ -575,6 +646,9 @@ public class MainActivity extends Activity {
 
     @Override public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
         super.onRequestPermissionsResult(req, perms, res);
+        if (req == 8 && res.length > 0 && res[0] == android.content.pm.PackageManager.PERMISSION_GRANTED && pendenteMic) {
+            pendenteMic = false; iniciarMic();
+        }
         if (req == 7 && res.length > 0 && res[0] == android.content.pm.PackageManager.PERMISSION_GRANTED && pendenteOuvir > 0) {
             int c = pendenteOuvir; pendenteOuvir = 0; ouvir(c, "");
         }

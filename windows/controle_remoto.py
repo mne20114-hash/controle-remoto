@@ -6,7 +6,7 @@ import base64, glob, json, os, random, socket, struct, subprocess, sys, threadin
 from difflib import get_close_matches
 from urllib.parse import quote_plus
 
-PORTA, PORTA_BUSCA = 8765, 8766
+PORTA, PORTA_BUSCA, PORTA_MIC = 8765, 8766, 8767
 WIN = sys.platform.startswith("win")
 
 # ------------------------------------------------------------ entrada do Windows
@@ -284,6 +284,120 @@ def vigiar_clipboard():
             enviar_todos(("clip," + base64.b64encode(t[:100000].encode("utf-8")).decode() + "\n").encode())
 
 
+# ------------------------------------------------------------ microfone do tablet -> VB-CABLE
+mic = {"estado": ""}
+
+
+def achar_cable():
+    if not WIN:
+        return None
+    class CAPS(ctypes.Structure):
+        _fields_ = [("wMid", wintypes.WORD), ("wPid", wintypes.WORD), ("vDriverVersion", wintypes.UINT),
+                    ("szPname", ctypes.c_wchar * 32), ("dwFormats", wintypes.DWORD), ("wChannels", wintypes.WORD),
+                    ("wReserved1", wintypes.WORD), ("dwSupport", wintypes.DWORD)]
+    w = ctypes.windll.winmm
+    for i in range(w.waveOutGetNumDevs()):
+        c = CAPS()
+        if w.waveOutGetDevCapsW(i, ctypes.byref(c), ctypes.sizeof(c)) == 0 and "CABLE Input" in c.szPname:
+            return i
+    return None
+
+
+class Saida:
+    def __init__(self, dev, taxa=48000):
+        class FMT(ctypes.Structure):
+            _fields_ = [("wFormatTag", wintypes.WORD), ("nChannels", wintypes.WORD), ("nSamplesPerSec", wintypes.DWORD),
+                        ("nAvgBytesPerSec", wintypes.DWORD), ("nBlockAlign", wintypes.WORD),
+                        ("wBitsPerSample", wintypes.WORD), ("cbSize", wintypes.WORD)]
+
+        class HDR(ctypes.Structure):
+            _fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", wintypes.DWORD), ("dwBytesRecorded", wintypes.DWORD),
+                        ("dwUser", ctypes.c_size_t), ("dwFlags", wintypes.DWORD), ("dwLoops", wintypes.DWORD),
+                        ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_size_t)]
+        self.HDR = HDR
+        self.w = w = ctypes.windll.winmm
+        w.waveOutOpen.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.UINT, ctypes.POINTER(FMT), ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+        for f in (w.waveOutPrepareHeader, w.waveOutWrite, w.waveOutUnprepareHeader):
+            f.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.UINT]
+        w.waveOutReset.argtypes = [wintypes.HANDLE]; w.waveOutClose.argtypes = [wintypes.HANDLE]
+        fmt = FMT(1, 1, taxa, taxa * 2, 2, 16, 0)
+        self.h = wintypes.HANDLE()
+        if w.waveOutOpen(ctypes.byref(self.h), dev, ctypes.byref(fmt), 0, 0, 0) != 0:
+            raise OSError("nao abriu o VB-CABLE")
+        self.fila = []
+
+    def tocar(self, dados):
+        w = self.w
+        vivos = []
+        for hdr, buf in self.fila:
+            if hdr.dwFlags & 1:  # WHDR_DONE
+                w.waveOutUnprepareHeader(self.h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+            else:
+                vivos.append((hdr, buf))
+        self.fila = vivos
+        if len(self.fila) > 8:  # mais de ~160 ms acumulados: descarta para nao atrasar
+            return
+        buf = ctypes.create_string_buffer(dados, len(dados))
+        hdr = self.HDR(ctypes.cast(buf, ctypes.c_void_p), len(dados), 0, 0, 0, 0, None, 0)
+        w.waveOutPrepareHeader(self.h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+        w.waveOutWrite(self.h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+        self.fila.append((hdr, buf))
+
+    def fechar(self):
+        self.w.waveOutReset(self.h)
+        for hdr, _ in self.fila:
+            self.w.waveOutUnprepareHeader(self.h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+        self.w.waveOutClose(self.h)
+
+
+def atender_mic(conn):
+    saida = None
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(10)
+        f = conn.makefile("rb")
+        partes = f.readline().decode("utf-8", "ignore").strip().split(",")
+        if len(partes) < 2 or partes[0] != "PIN" or partes[1] != estado["pin"]:
+            time.sleep(1); conn.sendall(b"NO\n"); return
+        dev = achar_cable()
+        if dev is None and WIN:
+            mic["estado"] = "Instale o VB-CABLE para usar o microfone do tablet."
+            conn.sendall(b"NOCABLE\n"); return
+        if WIN:
+            saida = Saida(dev)
+        conn.sendall(b"OK\n")
+        conn.settimeout(None)
+        mic["estado"] = "Microfone do tablet ATIVO (no Windows: 'CABLE Output')"
+        while True:
+            d = f.read1(3840) if hasattr(f, "read1") else f.read(1920)
+            if not d:
+                break
+            if len(d) % 2:
+                d += f.read(1)
+            if saida:
+                saida.tocar(d)
+    except OSError:
+        pass
+    finally:
+        if saida:
+            try:
+                saida.fechar()
+            except Exception:
+                pass
+        if mic["estado"].startswith("Microfone"):
+            mic["estado"] = ""
+        conn.close()
+
+
+def servidor_mic():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", PORTA_MIC)); s.listen(2)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=atender_mic, args=(c,), daemon=True).start()
+
+
 # ------------------------------------------------------------ rede
 
 
@@ -368,7 +482,7 @@ def janela():
     r = tk.Tk()
     r.title("Controle Remoto")
     r.configure(bg=BG)
-    r.geometry("440x420")
+    r.geometry("460x500")
     r.resizable(False, False)
     tk.Label(r, text="Controle Remoto", font=("Segoe UI", 18, "bold"), fg=FG, bg=BG).pack(pady=(18, 2))
     tk.Label(r, text="Abra o app no tablet e toque no computador.", font=("Segoe UI", 10), fg=SUB, bg=BG).pack()
@@ -379,12 +493,17 @@ def janela():
     lst.pack(pady=(6, 4))
     lips = tk.Label(r, text="", font=("Consolas", 10), fg=SUB, bg=BG, justify="center")
     lips.pack(pady=4)
+    lmic = tk.Label(r, text="", font=("Segoe UI", 10, "bold"), fg="#9FE0BD", bg=BG, wraplength=400)
+    lmic.pack(pady=2)
 
     def trocar():
         novo_pin(); lpin.config(text=estado["pin"])
 
     tk.Button(r, text="Gerar novo PIN", command=trocar, font=("Segoe UI", 10), bg="#262B3A", fg=FG,
               relief="flat", activebackground="#333A4E", activeforeground=FG, padx=12, pady=4).pack(pady=8)
+    tk.Button(r, text="Baixar driver do microfone (VB-CABLE, grátis)", command=lambda: webbrowser.open("https://vb-audio.com/Cable/"),
+              font=("Segoe UI", 9), bg="#262B3A", fg=FG, relief="flat", activebackground="#333A4E",
+              activeforeground=FG, padx=10, pady=3).pack(pady=2)
     tk.Label(r, text="Pode minimizar. Fechar a janela desliga o controle.", font=("Segoe UI", 9), fg=SUB, bg=BG).pack(side="bottom", pady=10)
 
     def atualizar():
@@ -392,6 +511,8 @@ def janela():
         lst.config(text=("● Conectado: " + ", ".join(c)) if c else "Aguardando o tablet...",
                    fg=VERDE if c else "#FFC857")
         lips.config(text="Endereços deste PC:\n" + "\n".join(ips() or ["(sem rede)"]))
+        cab = "" if achar_cable() is not None or not WIN else "Para usar o microfone do tablet no PC, instale o VB-CABLE (botão abaixo)."
+        lmic.config(text=mic["estado"] or cab, fg="#9FE0BD" if mic["estado"].startswith("Microfone") else "#FFC857")
         r.after(1500, atualizar)
 
     atualizar()
@@ -415,6 +536,7 @@ def main():
     threading.Thread(target=servidor_busca, daemon=True).start()
     threading.Thread(target=carregar_apps, daemon=True).start()
     threading.Thread(target=vigiar_clipboard, daemon=True).start()
+    threading.Thread(target=servidor_mic, daemon=True).start()
     try:
         r, _ = janela()
         r.mainloop()
