@@ -82,7 +82,7 @@ public class MainActivity extends Activity {
     static final int OUVIR_DITADO = 1, OUVIR_BUSCA = 2, OUVIR_ASSISTENTE = 3;
     static final String MODELO_PADRAO = "gpt-5.4-mini", MODELO_GEMINI = "gemini-3.8-flash";
 
-    static boolean ehGemini(String chave) { return chave.startsWith("AIza"); }
+    static boolean ehGemini(String chave) { return chave.startsWith("AIza") || chave.startsWith("AQ."); }
 
     String modeloAtual(String chave) {
         String m = prefs.getString("modelo", "");
@@ -546,11 +546,11 @@ public class MainActivity extends Activity {
 
     void configurarChave() {
         LinearLayout l = vertical(); l.setPadding(dp(20), dp(10), dp(20), 0);
-        EditText chave = new EditText(this); chave.setHint("Chave: Gemini (AIza...) ou OpenAI (sk-...)"); chave.setSingleLine(true);
+        EditText chave = new EditText(this); chave.setHint("Chave: Gemini (AQ... / AIza...) ou OpenAI (sk-...)"); chave.setSingleLine(true);
         chave.setText(prefs.getString("chave", ""));
         EditText modelo = new EditText(this); modelo.setHint("Modelo"); modelo.setSingleLine(true);
         modelo.setText(modeloAtual(prefs.getString("chave", "")));
-        l.addView(texto("GRÁTIS: crie a chave no Google AI Studio (aistudio.google.com > Get API key) e cole aqui.\nPago: chave da OpenAI (platform.openai.com). O app detecta qual é pela chave.", 14, Color.GRAY));
+        l.addView(texto("GRÁTIS: crie a chave no Google AI Studio (aistudio.google.com > Get API key) e cole aqui (AIza... ou AQ....).\nPago: chave da OpenAI (platform.openai.com). O app detecta qual é pela chave.", 14, Color.GRAY));
         l.addView(chave, mt(8));
         l.addView(texto("Modelo:", 14, Color.GRAY), mt(8));
         l.addView(modelo);
@@ -558,7 +558,7 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Salvar", (d, w) -> {
                     prefs.edit().putString("chave", chave.getText().toString().trim())
                             .putString("modelo", modelo.getText().toString().trim()).apply();
-                    usarEsforco = true;
+                    usarEsforco = true; historico = new JSONArray();
                     if (assistStatus != null) assistStatus.setText("Chave salva. Toque em Falar.");
                 })
                 .setNegativeButton("Cancelar", null).show();
@@ -600,12 +600,14 @@ public class MainActivity extends Activity {
                 }
                 historico.put(new JSONObject().put("role", "user").put("content", texto));
                 for (int volta = 0; volta < 8 && resposta == null; volta++) {
-                    JSONObject m = chamarOpenAI(chave).getJSONArray("choices").getJSONObject(0).getJSONObject("message");
+                    JSONObject m = ehGemini(chave) ? chamarGemini(chave)
+                            : chamarOpenAI(chave).getJSONArray("choices").getJSONObject(0).getJSONObject("message");
                     JSONArray calls = m.optJSONArray("tool_calls");
                     JSONObject limpo = new JSONObject().put("role", "assistant");
                     String conteudo = m.isNull("content") ? null : m.optString("content", null);
                     if (conteudo != null) limpo.put("content", conteudo);
                     if (calls != null && calls.length() > 0) limpo.put("tool_calls", calls);
+                    if (m.has("_gparts")) limpo.put("_gparts", m.get("_gparts"));
                     historico.put(limpo);
                     if (calls == null || calls.length() == 0) { resposta = conteudo == null ? "Pronto." : conteudo; break; }
                     for (int i = 0; i < calls.length(); i++) {
@@ -666,6 +668,91 @@ public class MainActivity extends Activity {
             throw new Exception("Erro " + cod + ": " + det);
         }
         return new JSONObject(body);
+    }
+
+    // Gemini nativo (aceita chaves AIza... e AQ....)
+    JSONObject chamarGemini(String chave) throws Exception {
+        JSONObject corpo = new JSONObject();
+        JSONArray contents = new JSONArray();
+        java.util.Map<String, String> nomes = new java.util.HashMap<>();
+        JSONObject ultimoUser = null; boolean ultimoEhTool = false;
+        for (int i = 0; i < historico.length(); i++) {
+            JSONObject h = historico.getJSONObject(i);
+            String role = h.getString("role");
+            if (role.equals("system")) {
+                corpo.put("systemInstruction", new JSONObject().put("parts", new JSONArray().put(new JSONObject().put("text", h.getString("content")))));
+            } else if (role.equals("user")) {
+                contents.put(new JSONObject().put("role", "user").put("parts", new JSONArray().put(new JSONObject().put("text", h.getString("content")))));
+                ultimoEhTool = false;
+            } else if (role.equals("assistant")) {
+                JSONArray parts;
+                if (h.has("_gparts")) parts = h.getJSONArray("_gparts");
+                else { parts = new JSONArray(); if (h.has("content")) parts.put(new JSONObject().put("text", h.getString("content"))); }
+                JSONArray tc = h.optJSONArray("tool_calls");
+                if (tc != null) for (int k = 0; k < tc.length(); k++)
+                    nomes.put(tc.getJSONObject(k).getString("id"), tc.getJSONObject(k).getJSONObject("function").getString("name"));
+                if (parts.length() > 0) contents.put(new JSONObject().put("role", "model").put("parts", parts));
+                ultimoEhTool = false;
+            } else if (role.equals("tool")) {
+                String id = h.getString("tool_call_id");
+                JSONObject fr = new JSONObject().put("functionResponse", new JSONObject()
+                        .put("name", nomes.containsKey(id) ? nomes.get(id) : "ferramenta")
+                        .put("response", new JSONObject().put("resultado", h.getString("content"))));
+                if (!ultimoEhTool) { ultimoUser = new JSONObject().put("role", "user").put("parts", new JSONArray()); contents.put(ultimoUser); }
+                ultimoUser.getJSONArray("parts").put(fr);
+                ultimoEhTool = true;
+            }
+        }
+        corpo.put("contents", contents);
+        JSONArray decl = new JSONArray();
+        JSONArray ferr = new JSONArray(FERRAMENTAS);
+        for (int i = 0; i < ferr.length(); i++) {
+            JSONObject f = ferr.getJSONObject(i).getJSONObject("function");
+            JSONObject d = new JSONObject().put("name", f.getString("name")).put("description", f.getString("description"));
+            JSONObject params = f.getJSONObject("parameters");
+            if (params.getJSONObject("properties").length() > 0) d.put("parameters", params);
+            decl.put(d);
+        }
+        corpo.put("tools", new JSONArray().put(new JSONObject().put("functionDeclarations", decl)));
+        String modelo = modeloAtual(chave);
+        HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
+        c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(15000); c.setReadTimeout(90000);
+        c.setRequestProperty("x-goog-api-key", chave);
+        c.setRequestProperty("Content-Type", "application/json");
+        try (OutputStream o = c.getOutputStream()) { o.write(corpo.toString().getBytes(StandardCharsets.UTF_8)); }
+        int cod = c.getResponseCode();
+        String body = ler(cod < 400 ? c.getInputStream() : c.getErrorStream());
+        if (cod >= 400) {
+            String det = body;
+            try { det = new JSONObject(body).getJSONObject("error").optString("message", body); } catch (Exception ignored) { }
+            if (cod == 401 || cod == 403) throw new Exception("Chave do Gemini recusada (" + det + "). Gere outra em aistudio.google.com e cole em ⚙ Chave.");
+            if (cod == 429) throw new Exception("Limite grátis do Gemini atingido. Espere um minuto e tente de novo.");
+            if (cod == 404) throw new Exception("Modelo \"" + modelo + "\" não encontrado. Troque em ⚙ Chave (ex.: gemini-2.5-flash).");
+            throw new Exception("Erro " + cod + ": " + det);
+        }
+        JSONObject r = new JSONObject(body);
+        JSONArray cands = r.optJSONArray("candidates");
+        if (cands == null || cands.length() == 0) throw new Exception("O Gemini não respondeu. Tente de novo.");
+        JSONObject content = cands.getJSONObject(0).optJSONObject("content");
+        JSONArray parts = content == null ? new JSONArray() : content.optJSONArray("parts");
+        if (parts == null) parts = new JSONArray();
+        StringBuilder txt = new StringBuilder();
+        JSONArray calls = new JSONArray();
+        for (int i = 0; i < parts.length(); i++) {
+            JSONObject pt = parts.getJSONObject(i);
+            if (pt.optBoolean("thought", false)) continue;
+            if (pt.has("text")) txt.append(pt.getString("text"));
+            if (pt.has("functionCall")) {
+                JSONObject fc = pt.getJSONObject("functionCall");
+                calls.put(new JSONObject().put("id", fc.optString("id", "chamada_" + System.nanoTime() + "_" + i)).put("type", "function")
+                        .put("function", new JSONObject().put("name", fc.getString("name"))
+                                .put("arguments", fc.optJSONObject("args") == null ? "{}" : fc.getJSONObject("args").toString())));
+            }
+        }
+        JSONObject m = new JSONObject().put("role", "assistant").put("_gparts", parts);
+        if (txt.length() > 0) m.put("content", txt.toString().trim());
+        if (calls.length() > 0) m.put("tool_calls", calls);
+        return m;
     }
 
     static String ler(InputStream is) throws Exception {
