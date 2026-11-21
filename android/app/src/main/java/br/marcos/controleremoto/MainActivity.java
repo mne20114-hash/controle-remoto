@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.speech.RecognizerIntent;
+import android.speech.RecognitionListener;
+import android.speech.SpeechRecognizer;
+import android.media.AudioManager;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.widget.Toast;
@@ -97,6 +100,10 @@ public class MainActivity extends Activity {
     String modeloGeminiOk = null;
     List<String> modelosDisponiveis = null;
     final Set<String> semThinking = new HashSet<>();
+    SpeechRecognizer reconhecedor;
+    boolean ouvindo = false;
+    int codigoOuvir = 0, pendenteOuvir = 0;
+    TextView avisoVoz;
 
     // pergunta ao Google quais modelos a chave pode usar (flash primeiro, mais novos primeiro)
     List<String> modelosGemini(String chave) {
@@ -130,7 +137,7 @@ public class MainActivity extends Activity {
         java.util.regex.Matcher v = java.util.regex.Pattern.compile("gemini-(\\d+(?:\\.\\d+)?)").matcher(n);
         if (v.find()) p += (int) (Float.parseFloat(v.group(1)) * 100);
         if (n.contains("preview")) p -= 1000;
-        if (n.contains("lite")) p -= 5;
+        if (n.contains("lite")) p += 50;
         if (n.matches(".*-\\d{3}$") || n.matches(".*\\d{2}-\\d{4}$")) p -= 1;
         if (n.endsWith("-latest")) p -= 2000;
         return p;
@@ -205,7 +212,7 @@ public class MainActivity extends Activity {
         else if (noPad) desconectar(); else super.onBackPressed();
     }
 
-    @Override protected void onDestroy() { fechar(); if (tts != null) tts.shutdown(); super.onDestroy(); }
+    @Override protected void onDestroy() { fechar(); if (tts != null) tts.shutdown(); if (reconhecedor != null) reconhecedor.destroy(); super.onDestroy(); }
 
     // ------------------------------------------------------------------ tela de conexão
     void mostrarConexao() {
@@ -432,6 +439,8 @@ public class MainActivity extends Activity {
         bts.addView(botao("Direito", CARD, v -> enviar("c,r")), peso(3));
         raiz.addView(bts, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
 
+        avisoVoz = texto("", 14, AMARELO); avisoVoz.setVisibility(View.GONE);
+        raiz.addView(avisoVoz, mt(4));
         LinearLayout voz = horizontal();
         voz.addView(botao("🎤 Ditar", 0xFF5B3FD1, v -> ouvir(OUVIR_DITADO, "Fale o texto para digitar")), peso(3));
         voz.addView(botao("🔎 Buscar por voz", 0xFF5B3FD1, v -> ouvir(OUVIR_BUSCA, "O que você quer pesquisar?")), peso(3));
@@ -501,8 +510,83 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ voz
+    void avisoOuvindo(String t) {
+        if (noAssistente && assistStatus != null) assistStatus.setText(t);
+        else if (avisoVoz != null) { avisoVoz.setText(t); avisoVoz.setVisibility(t.isEmpty() ? View.GONE : View.VISIBLE); }
+    }
+
+    void usarMicDoTablet() {
+        try {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (Build.VERSION.SDK_INT >= 31) am.clearCommunicationDevice();
+            if (am.isBluetoothScoOn()) { am.stopBluetoothSco(); am.setBluetoothScoOn(false); }
+            am.setMode(AudioManager.MODE_NORMAL);
+        } catch (Exception ignored) { }
+    }
+
     void ouvir(int codigo, String dica) {
         if (tts != null) tts.stop();
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            pendenteOuvir = codigo;
+            requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 7);
+            return;
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) { ouvirIntent(codigo, dica); return; }
+        if (ouvindo && reconhecedor != null) { reconhecedor.stopListening(); return; }
+        usarMicDoTablet();
+        if (reconhecedor == null) {
+            reconhecedor = SpeechRecognizer.createSpeechRecognizer(this);
+            reconhecedor.setRecognitionListener(new RecognitionListener() {
+                public void onReadyForSpeech(Bundle b) { avisoOuvindo("🎙 Ouvindo... pode falar (toque de novo para parar)"); }
+                public void onBeginningOfSpeech() { }
+                public void onRmsChanged(float v) { }
+                public void onBufferReceived(byte[] b) { }
+                public void onEndOfSpeech() { avisoOuvindo("Entendendo..."); }
+                public void onEvent(int t, Bundle b) { }
+                public void onPartialResults(Bundle b) {
+                    ArrayList<String> r = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (r != null && !r.isEmpty() && !r.get(0).isEmpty()) avisoOuvindo("🎙 " + r.get(0));
+                }
+                public void onError(int e) {
+                    ouvindo = false;
+                    avisoOuvindo(e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ? "Não ouvi nada. Toque e fale de novo."
+                            : e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ? "Permita o microfone para o app." : "Falha no microfone (erro " + e + "). Tente de novo.");
+                }
+                public void onResults(Bundle b) {
+                    ouvindo = false;
+                    ArrayList<String> r = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    avisoOuvindo("");
+                    if (r != null && !r.isEmpty()) tratarFala(codigoOuvir, r.get(0));
+                }
+            });
+        }
+        codigoOuvir = codigo;
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR");
+        i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000);
+        ouvindo = true;
+        avisoOuvindo("🎙 Preparando o microfone...");
+        reconhecedor.startListening(i);
+    }
+
+    @Override public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(req, perms, res);
+        if (req == 7 && res.length > 0 && res[0] == android.content.pm.PackageManager.PERMISSION_GRANTED && pendenteOuvir > 0) {
+            int c = pendenteOuvir; pendenteOuvir = 0; ouvir(c, "");
+        }
+    }
+
+    void tratarFala(int req, String fala) {
+        if (req == OUVIR_DITADO) enviarTexto(fala);
+        else if (req == OUVIR_BUSCA) { enviar("b," + fala); Toast.makeText(this, "Pesquisando: " + fala, Toast.LENGTH_SHORT).show(); }
+        else if (req == OUVIR_ASSISTENTE) perguntar(fala);
+    }
+
+    void ouvirIntent(int codigo, String dica) {
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR");
@@ -516,10 +600,7 @@ public class MainActivity extends Activity {
         if (res != RESULT_OK || data == null) return;
         ArrayList<String> r = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
         if (r == null || r.isEmpty()) return;
-        String fala = r.get(0);
-        if (req == OUVIR_DITADO) enviarTexto(fala);
-        else if (req == OUVIR_BUSCA) { enviar("b," + fala); Toast.makeText(this, "Pesquisando: " + fala, Toast.LENGTH_SHORT).show(); }
-        else if (req == OUVIR_ASSISTENTE) perguntar(fala);
+        tratarFala(req, r.get(0));
     }
 
     void falar(String t) {
@@ -648,7 +729,6 @@ public class MainActivity extends Activity {
 
     void perguntar(String texto) {
         String chave = prefs.getString("chave", "");
-        if (chave.isEmpty()) { configurarChave(); return; }
         if (pensando) return;
         pensando = true;
         adicionarBalao("Você", texto);
@@ -656,6 +736,17 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             String resposta = null;
             try {
+                String rapido = null;
+                try { rapido = comandoLocal(texto); } catch (Exception ignored) { }
+                if (rapido != null) {
+                    String fr = rapido;
+                    runOnUiThread(() -> { pensando = false; adicionarBalao("Assistente", "⚡ " + fr); statusAssistente(""); falar(fr); });
+                    return;
+                }
+                if (chave.isEmpty()) {
+                    runOnUiThread(() -> { pensando = false; adicionarBalao("Assistente", "Esse pedido precisa da IA. Cole a chave em ⚙ Chave."); configurarChave(); });
+                    return;
+                }
                 if (historico.length() == 0 || historico.length() > 40) {
                     historico = new JSONArray();
                     historico.put(new JSONObject().put("role", "system").put("content", SISTEMA));
@@ -672,6 +763,8 @@ public class MainActivity extends Activity {
                     if (m.has("_gparts")) limpo.put("_gparts", m.get("_gparts"));
                     historico.put(limpo);
                     if (calls == null || calls.length() == 0) { resposta = conteudo == null ? "Pronto." : conteudo; break; }
+                    boolean precisaVoltar = false;
+                    List<String> feitos = new ArrayList<>();
                     for (int i = 0; i < calls.length(); i++) {
                         JSONObject c = calls.getJSONObject(i);
                         JSONObject fn = c.getJSONObject("function");
@@ -683,6 +776,13 @@ public class MainActivity extends Activity {
                         String desc = "⚙ " + nome.replace('_', ' ') + " " + resumoArgs(args) + " → " + res;
                         runOnUiThread(() -> adicionarBalao("Ação", desc.length() > 220 ? desc.substring(0, 220) + "…" : desc));
                         historico.put(new JSONObject().put("role", "tool").put("tool_call_id", c.getString("id")).put("content", res));
+                        if (nome.equals("listar_programas") || res.startsWith("Nao encontrei") || res.startsWith("Erro") || res.startsWith("O notebook")) precisaVoltar = true;
+                        else feitos.add(nome.equals("abrir_programa") || nome.equals("energia") ? res : confirmacao(nome));
+                    }
+                    if (!precisaVoltar) {
+                        resposta = (conteudo != null && !conteudo.trim().isEmpty()) ? conteudo.trim() : String.join(" ", new java.util.LinkedHashSet<>(feitos));
+                        historico.put(new JSONObject().put("role", "assistant").put("content", resposta));
+                        break;
                     }
                 }
                 if (resposta == null) resposta = "Pronto.";
@@ -792,7 +892,7 @@ public class MainActivity extends Activity {
             boolean pensarPouco = !semThinking.contains(modelo);
             for (int tent = 0; tent < 2; tent++) {
                 JSONObject envio = new JSONObject(corpo.toString());
-                if (pensarPouco) envio.put("generationConfig", new JSONObject().put("thinkingConfig", new JSONObject().put("thinkingLevel", "low")));
+                if (pensarPouco) envio.put("generationConfig", new JSONObject().put("thinkingConfig", new JSONObject().put("thinkingLevel", "minimal")));
                 int cod; String b;
                 try {
                     HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
@@ -906,6 +1006,133 @@ public class MainActivity extends Activity {
             }
         }
         return "Ferramenta desconhecida.";
+    }
+
+    String confirmacao(String ferramenta) {
+        switch (ferramenta) {
+            case "abrir_site": return "Pronto, abri o site.";
+            case "pesquisar": return "Pronto, pesquisei.";
+            case "digitar": return "Digitei.";
+            default: return "Feito.";
+        }
+    }
+
+    // ------------------------------------------------------------------ comandos rápidos (sem IA)
+    static String norm(String t) {
+        String n = java.text.Normalizer.normalize(t.toLowerCase(Locale.ROOT), java.text.Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+        return n.replaceAll("[!?,;:]|\\.(?=\\s|$)", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    static final String[][] SITES = {
+            {"youtube", "https://www.youtube.com", "o YouTube"}, {"google", "https://www.google.com", "o Google"},
+            {"gmail", "https://mail.google.com", "o Gmail"}, {"e-mail", "https://mail.google.com", "o Gmail"}, {"email", "https://mail.google.com", "o Gmail"},
+            {"whatsapp", "https://web.whatsapp.com", "o WhatsApp"}, {"instagram", "https://www.instagram.com", "o Instagram"},
+            {"facebook", "https://www.facebook.com", "o Facebook"}, {"netflix", "https://www.netflix.com", "a Netflix"},
+            {"tiktok", "https://www.tiktok.com", "o TikTok"}, {"chatgpt", "https://chatgpt.com", "o ChatGPT"},
+            {"chat gpt", "https://chatgpt.com", "o ChatGPT"}, {"google drive", "https://drive.google.com", "o Drive"},
+            {"drive", "https://drive.google.com", "o Drive"}, {"mercado livre", "https://www.mercadolivre.com.br", "o Mercado Livre"},
+            {"shopee", "https://shopee.com.br", "a Shopee"}, {"github", "https://github.com", "o GitHub"},
+            {"canva", "https://www.canva.com", "o Canva"}, {"maps", "https://maps.google.com", "o Maps"},
+            {"google maps", "https://maps.google.com", "o Maps"}, {"tradutor", "https://translate.google.com", "o Tradutor"}};
+
+    static final String[][] TECLAS = {
+            {"nova aba", "ctrl+t", "Abri uma nova aba."}, {"nova guia", "ctrl+t", "Abri uma nova aba."},
+            {"fecha a aba", "ctrl+w", "Fechei a aba."}, {"fechar a aba", "ctrl+w", "Fechei a aba."}, {"fecha aba", "ctrl+w", "Fechei a aba."},
+            {"fecha essa aba", "ctrl+w", "Fechei a aba."}, {"reabre a aba", "ctrl+shift+t", "Reabri a aba."},
+            {"proxima aba", "ctrl+tab", "Pronto."}, {"aba anterior", "ctrl+shift+tab", "Pronto."},
+            {"volta a pagina", "alt+left", "Voltei."}, {"voltar a pagina", "alt+left", "Voltei."}, {"pagina anterior", "alt+left", "Voltei."},
+            {"atualiza", "f5", "Atualizei."}, {"atualizar", "f5", "Atualizei."}, {"recarrega", "f5", "Atualizei."},
+            {"tela cheia", "f11", "Pronto."}, {"area de trabalho", "win+d", "Pronto."}, {"minimiza tudo", "win+d", "Pronto."},
+            {"fecha o programa", "alt+f4", "Fechei."}, {"fecha a janela", "alt+f4", "Fechei."}, {"fechar a janela", "alt+f4", "Fechei."},
+            {"fecha isso", "alt+f4", "Fechei."}, {"troca de janela", "alt+tab", "Pronto."}, {"muda de janela", "alt+tab", "Pronto."},
+            {"pausa", "play", "Pronto."}, {"pause", "play", "Pronto."}, {"pausar", "play", "Pronto."}, {"despausa", "play", "Pronto."},
+            {"continua", "play", "Pronto."}, {"da play", "play", "Pronto."}, {"play", "play", "Pronto."},
+            {"proxima musica", "next", "Próxima."}, {"proximo video", "next", "Próximo."}, {"musica anterior", "prev", "Anterior."},
+            {"muta", "mute", "Pronto."}, {"mutar", "mute", "Pronto."}, {"silencia", "mute", "Pronto."}, {"tira o som", "mute", "Pronto."},
+            {"volta o som", "mute", "Pronto."}, {"copia", "ctrl+c", "Copiei."}, {"copiar", "ctrl+c", "Copiei."},
+            {"cola", "ctrl+v", "Colei."}, {"colar", "ctrl+v", "Colei."}, {"desfaz", "ctrl+z", "Desfeito."}, {"desfazer", "ctrl+z", "Desfeito."},
+            {"seleciona tudo", "ctrl+a", "Selecionei."}, {"salva", "ctrl+s", "Salvei."}, {"salvar", "ctrl+s", "Salvei."},
+            {"aperta enter", "enter", "Pronto."}, {"da enter", "enter", "Pronto."}, {"enter", "enter", "Pronto."}};
+
+    static final String[] PREFIXOS = {"eu quero que voce ", "quero que voce ", "voce pode ", "voce poderia ", "pode ", "por favor ",
+            "assistente ", "ei ", "oi ", "me ", "agora ", "eu quero ", "quero ", "preciso que voce ", "faz o favor de ", "faca "};
+
+    String limpar(String n) {
+        boolean mudou = true;
+        while (mudou) {
+            mudou = false;
+            for (String p : PREFIXOS) if (n.startsWith(p)) { n = n.substring(p.length()); mudou = true; }
+        }
+        return n.replaceAll("\\b(agora|por favor|pra mim|para mim|ai)\\b", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    String[] acaoDe(String parte, String[] anterior) {
+        String n = limpar(parte);
+        if (n.isEmpty()) return null;
+        String sp = " " + n + " ";
+        for (String[] t : TECLAS) if (sp.contains(" " + t[0] + " ")) return new String[]{"k", t[1], t[2], "1"};
+        if (n.contains("volume") || n.contains("som")) {
+            int vezes = n.contains("muito") || n.contains("bastante") ? 10 : 5;
+            if (n.matches(".*\\b(aumenta|aumentar|sobe|subir|mais alto)\\b.*")) return new String[]{"k", "volup", "Aumentei o volume.", "" + vezes};
+            if (n.matches(".*\\b(diminui|diminuir|abaixa|abaixar|baixa|baixar|mais baixo)\\b.*")) return new String[]{"k", "voldown", "Abaixei o volume.", "" + vezes};
+        }
+        if (n.matches("^(bloqueia|bloquear|trava|travar)( o)? (notebook|computador|pc|tela)$")) return new String[]{"e", "bloquear", "Bloqueei o notebook.", "1"};
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("^(pesquis\\w*|procur\\w*|busc\\w*)( por| sobre| o| a)? (.+?)( no youtube| na youtube| no google)?$").matcher(n);
+        if (m.find()) {
+            String q = m.group(3).trim(), onde = m.group(4) == null ? "" : m.group(4);
+            boolean yt = onde.contains("youtube") || (anterior != null && anterior[1].contains("youtube.com"));
+            if (q.isEmpty()) return null;
+            return new String[]{yt ? "y" : "s", q, yt ? "Pesquisando \"" + q + "\" no YouTube." : "Pesquisando \"" + q + "\".", "1"};
+        }
+        m = java.util.regex.Pattern.compile("^(abr\\w*|entr\\w* (no|na|em)|vai (no|na|para|pro|pra)|ir (no|na|para|pro|pra))( o| a| os| as| um| uma)? (.+)$").matcher(n);
+        if (m.find()) {
+            String alvo = m.group(m.groupCount()).trim();
+            alvo = alvo.replaceFirst("^(o |a )?(site|pagina|endereco) (do |da |de )?", "");
+            for (String[] s : SITES) if (alvo.equals(s[0]) || alvo.equals("site do " + s[0]) || alvo.equals("site da " + s[0]) || alvo.equals(s[0] + " web"))
+                return new String[]{"o", s[1], "Abrindo " + s[2] + ".", "1"};
+            if (alvo.matches("^[a-z0-9-]+(\\.[a-z0-9-]+)+(/.*)?$")) return new String[]{"o", "https://" + alvo, "Abrindo " + alvo + ".", "1"};
+            if (alvo.split(" ").length <= 4) return new String[]{"p", alvo, "", "1"};
+        }
+        return null;
+    }
+
+    // devolve a frase falada se resolveu sem IA; null para mandar à IA
+    String comandoLocal(String texto) throws Exception {
+        if (sock == null) return null;
+        String n = norm(texto);
+        String[] partes = n.split(" e (depois |em seguida |entao )?");
+        List<String[]> acoes = new ArrayList<>();
+        String[] anterior = null;
+        for (String p : partes) {
+            String[] a = acaoDe(p, anterior);
+            if (a == null) return null;
+            if (anterior != null && anterior[0].equals("o") && anterior[1].contains("youtube.com") && a[0].equals("y")) acoes.remove(acoes.size() - 1);
+            acoes.add(a); anterior = a;
+        }
+        if (acoes.isEmpty()) return null;
+        StringBuilder fala = new StringBuilder();
+        for (int i = 0; i < acoes.size(); i++) {
+            String[] a = acoes.get(i);
+            switch (a[0]) {
+                case "k": for (int r = 0; r < Integer.parseInt(a[3]); r++) enviar("k," + a[1]); break;
+                case "o": enviar("o," + a[1]); break;
+                case "s": enviar("b," + a[1]); break;
+                case "y": enviar("o,https://www.youtube.com/results?search_query=" + URLEncoder.encode(a[1], "UTF-8")); break;
+                case "e": enviar("e," + a[1]); break;
+                case "p": {
+                    respostas.clear(); enviar("p," + a[1]);
+                    String r = esperarResposta();
+                    if (!r.startsWith("Abri")) {
+                        if (i == 0 && !prefs.getString("chave", "").isEmpty()) return null;
+                        a[2] = "Não encontrei o programa " + a[1] + ".";
+                    } else a[2] = r.replace("Abri o programa:", "Abrindo").replace("Abri:", "Abrindo") + ".";
+                    break;
+                }
+            }
+            fala.append(a[2]).append(' ');
+            if (i < acoes.size() - 1) Thread.sleep(a[0].equals("o") || a[0].equals("p") ? 1500 : 300);
+        }
+        return fala.toString().trim();
     }
 
     // ------------------------------------------------------------------ touchpad
