@@ -50,8 +50,8 @@ jobs:
         with: { merge-multiple: true }
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.4.${{ github.run_number }}
-          name: Controle Remoto 1.4.${{ github.run_number }}
+          tag_name: v1.5.${{ github.run_number }}
+          name: Controle Remoto 1.5.${{ github.run_number }}
           make_latest: true
           body: |
             **Tablet Android:** baixe e instale o `ControleRemoto-Android.apk` (permita "instalar apps desconhecidos").

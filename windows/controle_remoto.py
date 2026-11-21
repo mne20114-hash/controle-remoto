@@ -2,7 +2,7 @@
 """Controle Remoto - programa do notebook (Windows).
 Recebe comandos do app Android por Wi-Fi ou pela rede Bluetooth (ancoragem)
 e move o mouse / digita no Windows."""
-import glob, json, os, random, socket, struct, subprocess, sys, threading, time, unicodedata, webbrowser
+import base64, glob, json, os, random, socket, struct, subprocess, sys, threading, time, unicodedata, webbrowser
 from difflib import get_close_matches
 from urllib.parse import quote_plus
 
@@ -223,6 +223,67 @@ try:
 except Exception:
     novo_pin()
 
+# ------------------------------------------------------------ área de transferência (PC -> tablet)
+clientes = {}  # conn -> lock
+
+
+def ler_clipboard():
+    if not WIN:
+        return None
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    u.GetClipboardData.restype = wintypes.HANDLE
+    k.GlobalLock.argtypes = [wintypes.HGLOBAL]; k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    for _ in range(5):
+        if u.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return None
+    try:
+        h = u.GetClipboardData(13)  # CF_UNICODETEXT
+        if not h:
+            return None
+        ptr = k.GlobalLock(h)
+        if not ptr:
+            return None
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            k.GlobalUnlock(h)
+    finally:
+        u.CloseClipboard()
+
+
+def enviar_todos(linha):
+    for conn, lock in list(clientes.items()):
+        try:
+            with lock:
+                conn.sendall(linha)
+        except OSError:
+            pass
+
+
+def vigiar_clipboard():
+    if not WIN:
+        return
+    seq_fn = ctypes.windll.user32.GetClipboardSequenceNumber
+    seq = seq_fn()
+    while True:
+        time.sleep(0.4)
+        n = seq_fn()
+        if n == seq:
+            continue
+        seq = n
+        try:
+            t = ler_clipboard()
+        except Exception:
+            t = None
+        if t and clientes:
+            enviar_todos(("clip," + base64.b64encode(t[:100000].encode("utf-8")).decode() + "\n").encode())
+
+
 # ------------------------------------------------------------ rede
 
 
@@ -241,6 +302,8 @@ def atender(conn, addr):
             nome = partes[2]
         conn.sendall(b"OK\n")
         conn.settimeout(None)
+        lock = threading.Lock()
+        clientes[conn] = lock
         estado["conectados"][ip] = nome or ip
         for raw in f:
             try:
@@ -248,11 +311,13 @@ def atender(conn, addr):
             except Exception as e:
                 r = None; print("erro:", e)
             if r:
-                conn.sendall(("r," + r.replace("\n", " ") + "\n").encode("utf-8"))
+                with lock:
+                    conn.sendall(("r," + r.replace("\n", " ") + "\n").encode("utf-8"))
     except OSError:
         pass
     finally:
         estado["conectados"].pop(ip, None)
+        clientes.pop(conn, None)
         conn.close()
 
 
@@ -349,6 +414,7 @@ def main():
     threading.Thread(target=servidor_tcp, args=(s,), daemon=True).start()
     threading.Thread(target=servidor_busca, daemon=True).start()
     threading.Thread(target=carregar_apps, daemon=True).start()
+    threading.Thread(target=vigiar_clipboard, daemon=True).start()
     try:
         r, _ = janela()
         r.mainloop()

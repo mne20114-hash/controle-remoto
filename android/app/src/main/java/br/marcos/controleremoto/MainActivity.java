@@ -94,6 +94,7 @@ public class MainActivity extends Activity {
     final List<String[]> conversa = new ArrayList<>();
     JSONArray historico = new JSONArray();
     TextToSpeech tts;
+    String modeloGeminiOk = null;
     boolean noAssistente = false, conversaContinua = false, usarEsforco = true, pensando = false;
     LinearLayout chatLista;
     ScrollView chatScroll;
@@ -274,6 +275,16 @@ public class MainActivity extends Activity {
                 String linha;
                 while ((linha = in.readLine()) != null) {
                     if (linha.startsWith("r,")) respostas.offer(linha.substring(2));
+                    else if (linha.startsWith("clip,") && prefs.getBoolean("clip", true)) {
+                        try {
+                            String t = new String(android.util.Base64.decode(linha.substring(5), android.util.Base64.DEFAULT), StandardCharsets.UTF_8);
+                            runOnUiThread(() -> {
+                                android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Notebook", t));
+                                if (Build.VERSION.SDK_INT < 33) Toast.makeText(this, "📋 Copiado do notebook", Toast.LENGTH_SHORT).show();
+                            });
+                        } catch (Exception ignored) { }
+                    }
                 }
             } catch (Exception e) {
                 if (!conectou) {
@@ -347,6 +358,17 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(SeekBar s) { }
         });
         topo.addView(sb, new LinearLayout.LayoutParams(dp(180), ViewGroup.LayoutParams.WRAP_CONTENT));
+        Button clip = botao(prefs.getBoolean("clip", true) ? "📋 Copiar do PC: ON" : "📋 Copiar do PC: OFF", prefs.getBoolean("clip", true) ? VERDE : CARD, null);
+        clip.setTextSize(14);
+        clip.setOnClickListener(v -> {
+            boolean on = !prefs.getBoolean("clip", true);
+            prefs.edit().putBoolean("clip", on).apply();
+            clip.setText(on ? "📋 Copiar do PC: ON" : "📋 Copiar do PC: OFF");
+            clip.setBackground(fundo(on ? VERDE : CARD));
+        });
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.rightMargin = dp(6);
+        topo.addView(clip, clp);
         Button sair = botao("Sair", VERMELHO, v -> desconectar()); sair.setTextSize(14);
         topo.addView(sair);
         raiz.addView(topo);
@@ -714,22 +736,34 @@ public class MainActivity extends Activity {
             decl.put(d);
         }
         corpo.put("tools", new JSONArray().put(new JSONObject().put("functionDeclarations", decl)));
-        String modelo = modeloAtual(chave);
-        HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
-        c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(15000); c.setReadTimeout(90000);
-        c.setRequestProperty("x-goog-api-key", chave);
-        c.setRequestProperty("Content-Type", "application/json");
-        try (OutputStream o = c.getOutputStream()) { o.write(corpo.toString().getBytes(StandardCharsets.UTF_8)); }
-        int cod = c.getResponseCode();
-        String body = ler(cod < 400 ? c.getInputStream() : c.getErrorStream());
-        if (cod >= 400) {
-            String det = body;
-            try { det = new JSONObject(body).getJSONObject("error").optString("message", body); } catch (Exception ignored) { }
-            if (cod == 401 || cod == 403) throw new Exception("Chave do Gemini recusada (" + det + "). Gere outra em aistudio.google.com e cole em ⚙ Chave.");
-            if (cod == 429) throw new Exception("Limite grátis do Gemini atingido. Espere um minuto e tente de novo.");
-            if (cod == 404) throw new Exception("Modelo \"" + modelo + "\" não encontrado. Troque em ⚙ Chave (ex.: gemini-2.5-flash).");
-            throw new Exception("Erro " + cod + ": " + det);
+        java.util.LinkedHashSet<String> modelos = new java.util.LinkedHashSet<>();
+        if (modeloGeminiOk != null) modelos.add(modeloGeminiOk);
+        modelos.add(modeloAtual(chave));
+        modelos.add("gemini-2.5-flash"); modelos.add("gemini-flash-latest"); modelos.add("gemini-2.5-flash-lite");
+        String body = null, aviso = "";
+        externo:
+        for (String modelo : modelos) {
+            for (int tent = 0; tent < 2; tent++) {
+                HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models/" + modelo + ":generateContent").openConnection();
+                c.setRequestMethod("POST"); c.setDoOutput(true); c.setConnectTimeout(15000); c.setReadTimeout(90000);
+                c.setRequestProperty("x-goog-api-key", chave);
+                c.setRequestProperty("Content-Type", "application/json");
+                try (OutputStream o = c.getOutputStream()) { o.write(corpo.toString().getBytes(StandardCharsets.UTF_8)); }
+                int cod = c.getResponseCode();
+                String b = ler(cod < 400 ? c.getInputStream() : c.getErrorStream());
+                if (cod < 400) { body = b; modeloGeminiOk = modelo; break externo; }
+                String det = b;
+                try { det = new JSONObject(b).getJSONObject("error").optString("message", b); } catch (Exception ignored) { }
+                if (cod == 401 || cod == 403) throw new Exception("Chave do Gemini recusada (" + det + "). Gere outra em aistudio.google.com e cole em ⚙ Chave.");
+                aviso = "Erro " + cod + ": " + det;
+                if (cod == 500 || cod == 503) { statusAssistente("Gemini ocupado, tentando de novo..."); Thread.sleep(1500); continue; }
+                if (cod == 429 || cod == 404) { statusAssistente("Tentando outro modelo do Gemini..."); continue externo; }
+                if (cod == 400 && modelo.equals(modeloGeminiOk)) { modeloGeminiOk = null; }
+                throw new Exception(aviso);
+            }
+            statusAssistente("Gemini ocupado, tentando outro modelo...");
         }
+        if (body == null) throw new Exception("O Gemini está sobrecarregado agora em todos os modelos grátis. Tente de novo em 1 minuto. (" + aviso + ")");
         JSONObject r = new JSONObject(body);
         JSONArray cands = r.optJSONArray("candidates");
         if (cands == null || cands.length() == 0) throw new Exception("O Gemini não respondeu. Tente de novo.");

@@ -1,7 +1,7 @@
 ﻿[Setup]
 AppId={{6F1B2C9A-3D4E-4F11-9A7B-A1B2C3D4E5F6}
 AppName=Controle Remoto
-AppVersion=1.2
+AppVersion=1.5
 AppPublisher=Marcos Calebe
 DefaultDirName={autopf}\Controle Remoto
 DefaultGroupName=Controle Remoto
