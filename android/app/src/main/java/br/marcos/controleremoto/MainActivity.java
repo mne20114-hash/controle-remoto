@@ -277,7 +277,12 @@ public class MainActivity extends Activity {
                 }
             } catch (Exception e) {
                 if (!conectou) {
-                    runOnUiThread(() -> { if (!noPad) status.setText("Não conectou. Confira o IP, a rede e se o programa está aberto no notebook."); });
+                    String m = (e instanceof java.net.ConnectException && String.valueOf(e.getMessage()).contains("ECONNREFUSED"))
+                            ? "O notebook recusou: o programa Controle Remoto não está aberto nesse IP."
+                            : (e instanceof java.net.SocketTimeoutException || String.valueOf(e.getMessage()).contains("ETIMEDOUT"))
+                            ? "Sem resposta do notebook: provável bloqueio do Firewall/antivírus, IP errado ou redes diferentes."
+                            : "Não conectou: " + e.getMessage();
+                    runOnUiThread(() -> { if (!noPad) status.setText(m); });
                 }
             }
             if (sock == s) {
