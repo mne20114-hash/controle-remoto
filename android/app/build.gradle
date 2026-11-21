@@ -1,0 +1,29 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'br.marcos.controleremoto'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'br.marcos.controleremoto'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+    signingConfigs {
+        fixa {
+            storeFile file('controle.jks')
+            storePassword 'controle123'
+            keyAlias 'controle'
+            keyPassword 'controle123'
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.fixa }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    lint { checkReleaseBuilds false; abortOnError false }
+}
