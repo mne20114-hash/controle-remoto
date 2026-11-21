@@ -95,6 +95,45 @@ public class MainActivity extends Activity {
     JSONArray historico = new JSONArray();
     TextToSpeech tts;
     String modeloGeminiOk = null;
+    List<String> modelosDisponiveis = null;
+
+    // pergunta ao Google quais modelos a chave pode usar (flash primeiro, mais novos primeiro)
+    List<String> modelosGemini(String chave) {
+        if (modelosDisponiveis != null) return modelosDisponiveis;
+        List<String> lista = new ArrayList<>();
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200").openConnection();
+            c.setConnectTimeout(10000); c.setReadTimeout(15000);
+            c.setRequestProperty("x-goog-api-key", chave);
+            if (c.getResponseCode() >= 400) return lista;
+            JSONArray ms = new JSONObject(ler(c.getInputStream())).optJSONArray("models");
+            for (int i = 0; ms != null && i < ms.length(); i++) {
+                JSONObject m = ms.getJSONObject(i);
+                String nome = m.getString("name").replace("models/", "");
+                String metodos = String.valueOf(m.optJSONArray("supportedGenerationMethods"));
+                if (!metodos.contains("generateContent") || !nome.contains("flash")) continue;
+                if (nome.matches(".*(image|tts|audio|live|embed|thinking|exp|computer|robotics).*")) continue;
+                lista.add(nome);
+            }
+            java.util.Collections.sort(lista, (a, b) -> {
+                int pa = pontos(a), pb = pontos(b);
+                return pa != pb ? Integer.compare(pb, pa) : b.compareTo(a);
+            });
+        } catch (Exception ignored) { }
+        if (!lista.isEmpty()) modelosDisponiveis = lista;
+        return lista;
+    }
+
+    static int pontos(String n) {
+        int p = 0;
+        java.util.regex.Matcher v = java.util.regex.Pattern.compile("gemini-(\\d+(?:\\.\\d+)?)").matcher(n);
+        if (v.find()) p += (int) (Float.parseFloat(v.group(1)) * 100);
+        if (n.contains("preview")) p -= 1000;
+        if (n.contains("lite")) p -= 5;
+        if (n.matches(".*-\\d{3}$") || n.matches(".*\\d{2}-\\d{4}$")) p -= 1;
+        if (n.endsWith("-latest")) p -= 2000;
+        return p;
+    }
     boolean noAssistente = false, conversaContinua = false, usarEsforco = true, pensando = false;
     LinearLayout chatLista;
     ScrollView chatScroll;
@@ -738,9 +777,13 @@ public class MainActivity extends Activity {
         corpo.put("tools", new JSONArray().put(new JSONObject().put("functionDeclarations", decl)));
         java.util.LinkedHashSet<String> modelos = new java.util.LinkedHashSet<>();
         if (modeloGeminiOk != null) modelos.add(modeloGeminiOk);
-        modelos.add(modeloAtual(chave));
-        modelos.add("gemini-2.5-flash"); modelos.add("gemini-flash-latest"); modelos.add("gemini-2.5-flash-lite");
+        List<String> disp = modelosGemini(chave);
+        String escolhido = modeloAtual(chave);
+        if (disp.isEmpty() || disp.contains(escolhido)) modelos.add(escolhido);
+        for (String m : disp) { if (modelos.size() >= 6) break; modelos.add(m); }
+        if (disp.isEmpty()) { modelos.add("gemini-3.5-flash"); modelos.add("gemini-3.5-flash-lite"); modelos.add("gemini-flash-latest"); }
         String body = null, aviso = "";
+        StringBuilder erros = new StringBuilder();
         externo:
         for (String modelo : modelos) {
             for (int tent = 0; tent < 2; tent++) {
@@ -756,6 +799,8 @@ public class MainActivity extends Activity {
                 try { det = new JSONObject(b).getJSONObject("error").optString("message", b); } catch (Exception ignored) { }
                 if (cod == 401 || cod == 403) throw new Exception("Chave do Gemini recusada (" + det + "). Gere outra em aistudio.google.com e cole em ⚙ Chave.");
                 aviso = "Erro " + cod + ": " + det;
+                if (tent == 0) erros.append("\n• ").append(modelo).append(": ").append(cod == 503 ? "ocupado" : cod == 429 ? "limite grátis atingido" : cod == 404 ? "indisponível" : "erro " + cod);
+                if (cod == 404) modelosDisponiveis = null;
                 if (cod == 500 || cod == 503) { statusAssistente("Gemini ocupado, tentando de novo..."); Thread.sleep(1500); continue; }
                 if (cod == 429 || cod == 404) { statusAssistente("Tentando outro modelo do Gemini..."); continue externo; }
                 if (cod == 400 && modelo.equals(modeloGeminiOk)) { modeloGeminiOk = null; }
@@ -763,7 +808,7 @@ public class MainActivity extends Activity {
             }
             statusAssistente("Gemini ocupado, tentando outro modelo...");
         }
-        if (body == null) throw new Exception("O Gemini está sobrecarregado agora em todos os modelos grátis. Tente de novo em 1 minuto. (" + aviso + ")");
+        if (body == null) throw new Exception("Nenhum modelo do Gemini respondeu agora. Tente de novo em 1 minuto." + erros);
         JSONObject r = new JSONObject(body);
         JSONArray cands = r.optJSONArray("candidates");
         if (cands == null || cands.length() == 0) throw new Exception("O Gemini não respondeu. Tente de novo.");
