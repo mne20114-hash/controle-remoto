@@ -80,7 +80,16 @@ public class MainActivity extends Activity {
     String nomePc = "", anterior = "";
     // voz e assistente
     static final int OUVIR_DITADO = 1, OUVIR_BUSCA = 2, OUVIR_ASSISTENTE = 3;
-    static final String MODELO_PADRAO = "gpt-5.4-mini";
+    static final String MODELO_PADRAO = "gpt-5.4-mini", MODELO_GEMINI = "gemini-3.8-flash";
+
+    static boolean ehGemini(String chave) { return chave.startsWith("AIza"); }
+
+    String modeloAtual(String chave) {
+        String m = prefs.getString("modelo", "");
+        boolean g = ehGemini(chave);
+        if (m.isEmpty() || (g && !m.startsWith("gemini")) || (!g && m.startsWith("gemini"))) return g ? MODELO_GEMINI : MODELO_PADRAO;
+        return m;
+    }
     final LinkedBlockingQueue<String> respostas = new LinkedBlockingQueue<>();
     final List<String[]> conversa = new ArrayList<>();
     JSONArray historico = new JSONArray();
@@ -500,7 +509,7 @@ public class MainActivity extends Activity {
         raiz.addView(chatScroll, sp);
         for (String[] m : conversa) desenharBalao(m[0], m[1]);
 
-        assistStatus = texto(prefs.getString("chave", "").isEmpty() ? "Toque em ⚙ Chave e cole sua chave da OpenAI." : "Toque em Falar e peça algo, ex.: \"abre o YouTube e pesquisa louvores\".", 14, AMARELO);
+        assistStatus = texto(prefs.getString("chave", "").isEmpty() ? "Toque em ⚙ Chave e cole sua chave (Gemini é grátis)." : "Toque em Falar e peça algo, ex.: \"abre o YouTube e pesquisa louvores\".", 14, AMARELO);
         raiz.addView(assistStatus, mt(4));
 
         LinearLayout fala = horizontal();
@@ -532,18 +541,18 @@ public class MainActivity extends Activity {
 
     void configurarChave() {
         LinearLayout l = vertical(); l.setPadding(dp(20), dp(10), dp(20), 0);
-        EditText chave = new EditText(this); chave.setHint("Chave da API (sk-...)"); chave.setSingleLine(true);
+        EditText chave = new EditText(this); chave.setHint("Chave: Gemini (AIza...) ou OpenAI (sk-...)"); chave.setSingleLine(true);
         chave.setText(prefs.getString("chave", ""));
         EditText modelo = new EditText(this); modelo.setHint("Modelo"); modelo.setSingleLine(true);
-        modelo.setText(prefs.getString("modelo", MODELO_PADRAO));
-        l.addView(texto("Crie a chave em platform.openai.com > API keys (mesmo e-mail do ChatGPT Pro, com os créditos resgatados).", 14, Color.GRAY));
+        modelo.setText(modeloAtual(prefs.getString("chave", "")));
+        l.addView(texto("GRÁTIS: crie a chave no Google AI Studio (aistudio.google.com > Get API key) e cole aqui.\nPago: chave da OpenAI (platform.openai.com). O app detecta qual é pela chave.", 14, Color.GRAY));
         l.addView(chave, mt(8));
         l.addView(texto("Modelo:", 14, Color.GRAY), mt(8));
         l.addView(modelo);
-        new AlertDialog.Builder(this).setTitle("Assistente — OpenAI").setView(l)
+        new AlertDialog.Builder(this).setTitle("Assistente — chave de IA").setView(l)
                 .setPositiveButton("Salvar", (d, w) -> {
                     prefs.edit().putString("chave", chave.getText().toString().trim())
-                            .putString("modelo", modelo.getText().toString().trim().isEmpty() ? MODELO_PADRAO : modelo.getText().toString().trim()).apply();
+                            .putString("modelo", modelo.getText().toString().trim()).apply();
                     usarEsforco = true;
                     if (assistStatus != null) assistStatus.setText("Chave salva. Toque em Falar.");
                 })
@@ -627,11 +636,11 @@ public class MainActivity extends Activity {
 
     JSONObject chamarOpenAI(String chave) throws Exception {
         JSONObject corpo = new JSONObject();
-        corpo.put("model", prefs.getString("modelo", MODELO_PADRAO));
+        corpo.put("model", modeloAtual(chave));
         corpo.put("messages", historico);
         corpo.put("tools", new JSONArray(FERRAMENTAS));
         if (usarEsforco) corpo.put("reasoning_effort", "low");
-        HttpURLConnection c = (HttpURLConnection) new URL("https://api.openai.com/v1/chat/completions").openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(ehGemini(chave) ? "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" : "https://api.openai.com/v1/chat/completions").openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setConnectTimeout(15000);
@@ -647,8 +656,8 @@ public class MainActivity extends Activity {
             String det = body;
             try { det = new JSONObject(body).getJSONObject("error").optString("message", body); } catch (Exception ignored) { }
             if (cod == 401) throw new Exception("Chave de API inválida. Toque em ⚙ Chave e confira.");
-            if (cod == 429) throw new Exception("Sem créditos ou limite atingido na API. Confira se os créditos do ChatGPT Pro foram resgatados. (" + det + ")");
-            if (cod == 404 || det.contains("model")) throw new Exception("Problema com o modelo \"" + prefs.getString("modelo", MODELO_PADRAO) + "\": " + det + " Troque o modelo em ⚙ Chave.");
+            if (cod == 429) throw new Exception("Limite ou créditos da API esgotados. No Gemini grátis, espere um minuto e tente de novo. (" + det + ")");
+            if (cod == 404 || det.contains("model")) throw new Exception("Problema com o modelo \"" + modeloAtual(chave) + "\": " + det + " Troque o modelo em ⚙ Chave.");
             throw new Exception("Erro " + cod + ": " + det);
         }
         return new JSONObject(body);
